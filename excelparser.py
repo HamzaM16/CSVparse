@@ -46,44 +46,115 @@ def search_excel_with_gui():
     ]
 
     try:
-        # First, let's examine the raw file to detect the separator
-        print("Examining raw file content...")
-
-        with open(csv_file_path, "r", encoding="utf-8", errors="ignore") as f:
-            first_line = f.readline().strip()
-            second_line = f.readline().strip()
-
-        print(f"First line: '{first_line}'")
-        print(f"Second line: '{second_line}'")
-
-        # Count potential separators in the header line
-        separators = [",", "\t", ";", "|"]
-        separator_counts = {}
-        for sep in separators:
-            count = first_line.count(sep)
-            separator_counts[sep] = count
-            print(f"'{sep}' appears {count} times in header")
-
-        # Find the separator with the most occurrences
-        best_separator = max(separator_counts, key=separator_counts.get)
-        print(
-            f"Best separator appears to be: '{best_separator}' (count: {separator_counts[best_separator]})"
-        )
-
-        # Try reading with the detected separator
-        df = None
-        if separator_counts[best_separator] > 0:
+        # Helper: sniff header line and separator, skipping preamble lines
+        def sniff_header_and_separator(file_path, max_lines=200):
+            print("Sniffing header and separator from the first lines...")
             try:
-                if best_separator == "\t":
-                    df = pd.read_csv(csv_file_path, sep="\t")
-                else:
-                    df = pd.read_csv(csv_file_path, sep=best_separator)
-                print(
-                    f"Successfully read with separator '{best_separator}': {df.shape}"
-                )
-                print(f"Columns: {list(df.columns)}")
+                lines = []
+                with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                    for i, line in enumerate(f):
+                        if i >= max_lines:
+                            break
+                        lines.append(line.rstrip("\n"))
+                if not lines:
+                    return None
             except Exception as e:
-                print(f"Failed to read with detected separator: {e}")
+                print(f"Sniffer failed to read lines: {e}")
+                return None
+
+            separators = [",", "\t", ";", "|"]
+            keywords = ("asset", "country", "revenue", "id", "code", "name")
+
+            best = None  # tuple: (score_tuple, header_index, sep)
+            for sep in separators:
+                for idx, raw in enumerate(lines):
+                    tokens = [t.strip() for t in raw.split(sep)]
+                    num_cols = len(tokens)
+                    non_empty = sum(1 for t in tokens if t != "")
+                    unique_nonempty = len(set(t.lower() for t in tokens if t != ""))
+                    keyword_hits = sum(1 for t in tokens if any(k in t.lower() for k in keywords))
+
+                    # Require at least two non-empty fields to be considered a header
+                    if non_empty <= 1 or num_cols <= 1:
+                        continue
+
+                    # Score favors many non-empty, multiple unique, and keyword presence
+                    score = (
+                        keyword_hits * 3 +
+                        non_empty * 2 +
+                        (2 if unique_nonempty >= 2 else 0)
+                    )
+
+                    candidate = (score, non_empty, num_cols, -idx)
+                    if best is None or candidate > best[0]:
+                        best = (candidate, idx, sep)
+
+            if best is None:
+                return None
+
+            header_index = best[1]
+            sep = best[2]
+            print(f"Sniffer chose header at line {header_index + 1} with separator '{'TAB' if sep == '\t' else sep}'")
+            preview = lines[header_index: header_index + 2]
+            print(f"Header preview: {preview}")
+            return {"header_index": header_index, "sep": sep, "first_line": lines[0] if lines else ""}
+
+        # First try: use sniffer to skip preamble rows and pick a separator
+        sniff = sniff_header_and_separator(csv_file_path)
+        df = None
+        first_line = ""
+        if sniff is not None:
+            first_line = sniff.get("first_line", "")
+            try:
+                df = pd.read_csv(
+                    csv_file_path,
+                    sep=sniff["sep"],
+                    skiprows=sniff["header_index"],
+                    header=0,
+                    engine="python",
+                )
+                print(f"Read via sniffer: {df.shape}, Columns: {list(df.columns)}")
+            except Exception as e:
+                print(f"Sniffer-based read failed: {e}")
+
+        # If sniffer failed, fall back to previous detection on the raw first line
+        if df is None or len(df.columns) <= 1:
+            print("Examining raw file content...")
+
+            with open(csv_file_path, "r", encoding="utf-8", errors="ignore") as f:
+                first_line = f.readline().strip()
+                second_line = f.readline().strip()
+
+            print(f"First line: '{first_line}'")
+            print(f"Second line: '{second_line}'")
+
+            # Count potential separators in the header line
+            separators = [",", "\t", ";", "|"]
+            separator_counts = {}
+            for sep in separators:
+                count = first_line.count(sep)
+                separator_counts[sep] = count
+                print(f"'{sep}' appears {count} times in header")
+
+            # Find the separator with the most occurrences
+            best_separator = max(separator_counts, key=separator_counts.get)
+            print(
+                f"Best separator appears to be: '{best_separator}' (count: {separator_counts[best_separator]})"
+            )
+
+            # Try reading with the detected separator
+            if separator_counts[best_separator] > 0:
+                try:
+                    if best_separator == "\t":
+                        df = pd.read_csv(csv_file_path, sep="\t")
+                    else:
+                        df = pd.read_csv(csv_file_path, sep=best_separator)
+                    print(
+                        f"Successfully read with separator '{best_separator}': {df.shape}"
+                    )
+                    print(f"Columns: {list(df.columns)}")
+                except Exception as e:
+                    print(f"Failed to read with detected separator: {e}")
 
         # If auto-detection failed, try each separator manually
         if df is None or len(df.columns) <= 1:
@@ -96,7 +167,7 @@ def search_excel_with_gui():
                 ("pipe", "|"),
             ]:
                 try:
-                    df = pd.read_csv(csv_file_path, sep=sep_char)
+                    df = pd.read_csv(csv_file_path, sep=sep_char, engine="python")
                     print(f"Trying {sep_name} separator: got {len(df.columns)} columns")
                     if len(df.columns) > 1:
                         print(f"Success with {sep_name}! Columns: {list(df.columns)}")
@@ -205,7 +276,9 @@ def search_excel_with_gui():
         print(
             f"Found columns - Asset: '{asset_col}', Country: '{country_col}', Revenue: '{revenue_col}'"
         )
-
+        
+        # (Legacy exact-match logic replaced by robust detection above)
+        
         # Check what we found
         if not asset_col:
             messagebox.showerror(
@@ -213,14 +286,14 @@ def search_excel_with_gui():
                 f"'Asset ID' column not found.\nAvailable columns: {list(df.columns)}",
             )
             return
-
+        
         if not country_col:
             messagebox.showerror(
                 "Column Missing",
                 f"'Country' column not found.\nAvailable columns: {list(df.columns)}",
             )
             return
-
+        
         if not revenue_col:
             messagebox.showwarning(
                 "Revenue Column",
