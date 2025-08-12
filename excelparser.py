@@ -2,6 +2,8 @@ import pandas as pd
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog
 import os
+import re
+import unicodedata
 
 
 def search_excel_with_gui():
@@ -126,31 +128,80 @@ def search_excel_with_gui():
             return
 
         # Clean column names
-        df.columns = df.columns.str.strip()
+        df.columns = df.columns.str.strip().str.replace(r'^\ufeff', '', regex=True)
 
-        # Look for the exact columns we need
-        asset_col = None
-        country_col = None
-        revenue_col = None
+        # Robust column detection with normalization and synonyms
+        def normalize_col_name(name):
+            if not isinstance(name, str):
+                name = str(name)
+            name = unicodedata.normalize("NFKC", name)
+            name = name.replace("\ufeff", "").strip().lower()
+            name = re.sub(r"[()\[\]{}]", " ", name)
+            name = re.sub(r"[\s\-_.:/\\]+", " ", name)
+            tokens = name.split()
+            joined = "".join(tokens)
+            joined = re.sub(r"[^a-z0-9]", "", joined)
+            return joined
 
-        # Find Asset ID column
-        for col in df.columns:
-            if col == "Asset ID":
-                asset_col = col
-                break
+        normalized_map = {col: normalize_col_name(col) for col in df.columns}
 
-        # Find Country column
-        for col in df.columns:
-            if col == "Country":
-                country_col = col
-                break
+        def find_by_candidates(candidates):
+            # First pass: exact matches on normalized names
+            for original, norm in normalized_map.items():
+                if norm in candidates:
+                    return original
+            # Second pass: substring containment for near-matches
+            for original, norm in normalized_map.items():
+                if any(c in norm for c in candidates):
+                    return original
+            return None
 
-        # Find any revenue column
-        for col in df.columns:
-            if "revenue" in col.lower() or "Revenue" in col:
-                revenue_col = col
-                break
+        # Candidate synonym sets
+        asset_candidates = {
+            "assetid", "idasset", "assetno", "assetnumber", "assetcode",
+            "assetidentifier", "assetref", "assetreference", "asset"
+        }
+        country_code_candidates = {
+            "countrycode", "countryiso", "countryiso2", "countryiso3",
+            "isocode", "iso2", "iso3", "alpha2", "alpha3",
+            "countryalpha2", "countryalpha3", "cntrycd", "cntrycode"
+        }
+        revenue_candidates = {
+            "revenue", "totalrevenue", "grossrevenue", "netrevenue",
+            "revenueusd", "rev", "salesrevenue", "turnover", "sales"
+        }
 
+        # Resolve asset column
+        asset_col = find_by_candidates(asset_candidates)
+
+        # Resolve country column, preferring code-like fields
+        country_col = find_by_candidates(country_code_candidates)
+        if country_col is None:
+            # Heuristic: choose a column whose values look like ISO 3166 codes (AA or AAA)
+            likely = []
+            for original in df.columns:
+                series = df[original].astype(str).str.strip().str.upper()
+                non_null = series[series != ""].head(200)
+                if len(non_null) == 0:
+                    continue
+                matches = non_null.str.match(r"^[A-Z]{2,3}$", na=False)
+                ratio = matches.mean() if len(matches) else 0
+                if ratio >= 0.6:
+                    likely.append((ratio, original))
+            if likely:
+                likely.sort(reverse=True)
+                country_col = likely[0][1]
+
+        # Resolve revenue column
+        revenue_col = find_by_candidates(revenue_candidates)
+        if revenue_col is None:
+            # Last resort: any column whose normalized name contains 'revenue'
+            for original, norm in normalized_map.items():
+                if "revenue" in norm:
+                    revenue_col = original
+                    break
+
+        print(f"Column detection mapping: {normalized_map}")
         print(
             f"Found columns - Asset: '{asset_col}', Country: '{country_col}', Revenue: '{revenue_col}'"
         )
@@ -227,7 +278,15 @@ def search_excel_with_gui():
                 filtered_df.to_csv(output_path, index=False)
 
                 if revenue_col:
-                    total_revenue = filtered_df[revenue_col].sum()
+                    numeric_rev = pd.to_numeric(
+                        filtered_df[revenue_col]
+                        .astype(str)
+                        .str.replace(",", "", regex=False)
+                        .str.replace("$", "", regex=False)
+                        .str.strip(),
+                        errors="coerce",
+                    )
+                    total_revenue = numeric_rev.sum()
                     messagebox.showinfo(
                         "Results Saved",
                         f"Filtered data saved to:\n{output_path}\n\nTotal Revenue: ${total_revenue:,.2f}",
